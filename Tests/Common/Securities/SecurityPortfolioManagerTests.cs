@@ -292,10 +292,23 @@ namespace QuantConnect.Tests.Common.Securities
             // this would not cause a margin call due to leverage = 1
             bool issueMarginCallWarning;
             var marginCallOrders = portfolio.ScanForMarginCall(out issueMarginCallWarning);
+            Assert.IsFalse(issueMarginCallWarning);
             Assert.AreEqual(0, marginCallOrders.Count);
 
-            // now change the leverage and buy more and we'll get a margin call
+            // now change the leverage to test margin call warning and margin call logic
             security.SetLeverage(leverage * 2);
+
+            // Stock price increase by minimum variation
+            const decimal newPrice = lowPrice + 0.01m;
+            security.SetMarketPrice(new TradeBar(time, Symbols.AAPL, newPrice, newPrice, newPrice, newPrice, 1));
+
+            // this would not cause a margin call, only a margin call warning
+            marginCallOrders = portfolio.ScanForMarginCall(out issueMarginCallWarning);
+            Assert.IsTrue(issueMarginCallWarning);
+            Assert.AreEqual(0, marginCallOrders.Count);
+
+            // Price drops again to previous low, margin call orders will be issued 
+            security.SetMarketPrice(new TradeBar(time, Symbols.AAPL, lowPrice, lowPrice, lowPrice, lowPrice, 1));
 
             order = new MarketOrder(Symbols.AAPL, quantity, time) { Price = buyPrice };
             fill = new OrderEvent(order, DateTime.UtcNow, 0) { FillPrice = buyPrice, FillQuantity = quantity };
@@ -305,6 +318,7 @@ namespace QuantConnect.Tests.Common.Securities
             Assert.AreEqual(0, portfolio.TotalPortfolioValue);
 
             marginCallOrders = portfolio.ScanForMarginCall(out issueMarginCallWarning);
+            Assert.IsTrue(issueMarginCallWarning);
             Assert.AreNotEqual(0, marginCallOrders.Count);
             Assert.AreEqual(-security.Holdings.Quantity, marginCallOrders[0].Quantity); // we bought twice
             Assert.GreaterOrEqual(-portfolio.MarginRemaining, security.Price * marginCallOrders[0].Quantity);
@@ -505,6 +519,120 @@ namespace QuantConnect.Tests.Common.Securities
             portfolio.ScanForCashSettlement(timeUtc);
             Assert.AreEqual(998, portfolio.Cash);
             Assert.AreEqual(0, portfolio.UnsettledCash);
+        }
+
+        [Test]
+        public void ComputeMarginProperlyLongSellZeroShort()
+        {
+            const decimal leverage = 2m;
+            const int amount = 1000;
+            const int quantity = (int)(amount * leverage);
+            var securities = new SecurityManager(TimeKeeper);
+            var transactions = new SecurityTransactionManager(securities);
+            var orderProcessor = new OrderProcessor();
+            transactions.SetOrderProcessor(orderProcessor);
+            var portfolio = new SecurityPortfolioManager(securities, transactions);
+            portfolio.CashBook["USD"].SetAmount(amount);
+
+            var config = CreateTradeBarDataConfig(SecurityType.Equity, Symbols.AAPL);
+            securities.Add(new Security(SecurityExchangeHours, config, new Cash(CashBook.AccountCurrency, 0, 1m), SymbolProperties.GetDefault(CashBook.AccountCurrency)));
+            var security = securities[Symbols.AAPL];
+            security.SetLeverage(leverage);
+            
+            var time = DateTime.Now;
+            const decimal buyPrice = 1m;
+            security.SetMarketPrice(new TradeBar(time, Symbols.AAPL, buyPrice, buyPrice, buyPrice, buyPrice, 1));
+
+            var order = new MarketOrder(Symbols.AAPL, quantity, time) { Price = buyPrice };
+            var fill = new OrderEvent(order, DateTime.UtcNow, 0) { FillPrice = buyPrice, FillQuantity = quantity };
+            orderProcessor.AddOrder(order);
+            var request = new SubmitOrderRequest(OrderType.Market, security.Type, security.Symbol, order.Quantity, 0, 0, order.Time, null);
+            request.SetOrderId(0);
+            orderProcessor.AddTicket(new OrderTicket(null, request));
+
+            portfolio.ProcessFill(fill);
+
+            // we shouldn't be able to place a new buy order
+            var newOrder = new MarketOrder(Symbols.AAPL, 1, time.AddSeconds(1)) { Price = buyPrice };
+            bool sufficientCapital = transactions.GetSufficientCapitalForOrder(portfolio, newOrder);
+            Assert.IsFalse(sufficientCapital);
+
+            // we should be able to place sell to zero
+            newOrder = new MarketOrder(Symbols.AAPL, -quantity, time.AddSeconds(1)) { Price = buyPrice };
+            sufficientCapital = transactions.GetSufficientCapitalForOrder(portfolio, newOrder);
+            Assert.IsTrue(sufficientCapital);
+
+            // now the stock plummets, so we should have negative margin remaining
+            time = time.AddDays(1);
+            const decimal lowPrice = buyPrice / 2;
+            security.SetMarketPrice(new TradeBar(time, Symbols.AAPL, lowPrice, lowPrice, lowPrice, lowPrice, 1));
+
+            // we still should be able to place sell to zero
+            newOrder = new MarketOrder(Symbols.AAPL, -quantity, time.AddSeconds(1)) { Price = lowPrice };
+            sufficientCapital = transactions.GetSufficientCapitalForOrder(portfolio, newOrder);
+            Assert.IsTrue(sufficientCapital);
+
+            // we shouldn't be able to place sell to short
+            newOrder = new MarketOrder(Symbols.AAPL, -quantity - 1, time.AddSeconds(1)) { Price = lowPrice };
+            sufficientCapital = transactions.GetSufficientCapitalForOrder(portfolio, newOrder);
+            Assert.IsFalse(sufficientCapital);
+        }
+
+        [Test]
+        public void ComputeMarginProperlyShortCoverZeroLong()
+        {
+            const decimal leverage = 2m;
+            const int amount = 1000;
+            const int quantity = (int)(amount * leverage);
+            var securities = new SecurityManager(TimeKeeper);
+            var transactions = new SecurityTransactionManager(securities);
+            var orderProcessor = new OrderProcessor();
+            transactions.SetOrderProcessor(orderProcessor);
+            var portfolio = new SecurityPortfolioManager(securities, transactions);
+            portfolio.CashBook["USD"].SetAmount(amount);
+
+            var config = CreateTradeBarDataConfig(SecurityType.Equity, Symbols.AAPL);
+            securities.Add(new Security(SecurityExchangeHours, config, new Cash(CashBook.AccountCurrency, 0, 1m), SymbolProperties.GetDefault(CashBook.AccountCurrency)));
+            var security = securities[Symbols.AAPL];
+            security.SetLeverage(leverage);
+
+            var time = DateTime.Now;
+            const decimal sellPrice = 1m;
+            security.SetMarketPrice(new TradeBar(time, Symbols.AAPL, sellPrice, sellPrice, sellPrice, sellPrice, 1));
+
+            var order = new MarketOrder(Symbols.AAPL, -quantity, time) { Price = sellPrice };
+            var fill = new OrderEvent(order, DateTime.UtcNow, 0) { FillPrice = sellPrice, FillQuantity = -quantity };
+            orderProcessor.AddOrder(order);
+            var request = new SubmitOrderRequest(OrderType.Market, security.Type, security.Symbol, order.Quantity, 0, 0, order.Time, null);
+            request.SetOrderId(0);
+            orderProcessor.AddTicket(new OrderTicket(null, request));
+
+            portfolio.ProcessFill(fill);
+
+            // we shouldn't be able to place a new short order
+            var newOrder = new MarketOrder(Symbols.AAPL, -1, time.AddSeconds(1)) { Price = sellPrice };
+            var sufficientCapital = transactions.GetSufficientCapitalForOrder(portfolio, newOrder);
+            Assert.IsFalse(sufficientCapital);
+
+            // we should be able to place cover to zero
+            newOrder = new MarketOrder(Symbols.AAPL, quantity, time.AddSeconds(1)) { Price = sellPrice };
+            sufficientCapital = transactions.GetSufficientCapitalForOrder(portfolio, newOrder);
+            Assert.IsTrue(sufficientCapital);
+
+            // now the stock doubles, so we should have negative margin remaining
+            time = time.AddDays(1);
+            const decimal highPrice = sellPrice * 2;
+            security.SetMarketPrice(new TradeBar(time, Symbols.AAPL, highPrice, highPrice, highPrice, highPrice, 1));
+
+            // we still shouldn be able to place cover to zero
+            newOrder = new MarketOrder(Symbols.AAPL, quantity, time.AddSeconds(1)) { Price = highPrice };
+            sufficientCapital = transactions.GetSufficientCapitalForOrder(portfolio, newOrder);
+            Assert.IsTrue(sufficientCapital);
+
+            // we shouldn't be able to place cover to long
+            newOrder = new MarketOrder(Symbols.AAPL, quantity + 1, time.AddSeconds(1)) { Price = highPrice };
+            sufficientCapital = transactions.GetSufficientCapitalForOrder(portfolio, newOrder);
+            Assert.IsFalse(sufficientCapital);
         }
 
         private SubscriptionDataConfig CreateTradeBarDataConfig(SecurityType type, Symbol symbol)

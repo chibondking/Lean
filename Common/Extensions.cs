@@ -81,12 +81,13 @@ namespace QuantConnect
         /// Extension method to convert a byte array into a string.
         /// </summary>
         /// <param name="bytes">Byte array to convert.</param>
+        /// <param name="encoding">The encoding to use for the conversion. Defaults to Encoding.ASCII</param>
         /// <returns>String from bytes.</returns>
-        public static string GetString(this byte[] bytes) 
+        public static string GetString(this byte[] bytes, Encoding encoding = null)
         {
-            var chars = new char[bytes.Length / sizeof(char)];
-            Buffer.BlockCopy(bytes, 0, chars, 0, bytes.Length);
-            return new string(chars);
+            if (encoding == null) encoding = Encoding.ASCII;
+
+            return encoding.GetString(bytes);
         }
 
         /// <summary>
@@ -103,6 +104,23 @@ namespace QuantConnect
                 foreach (var t in data) builder.Append(t.ToString("x2"));
             }
             return builder.ToString();
+        }
+
+        /// <summary>
+        /// Encrypt the token:time data to make our API hash.
+        /// </summary>
+        /// <param name="data">Data to be hashed by SHA256</param>
+        /// <returns>Hashed string.</returns>
+        public static string ToSHA256(this string data)
+        {
+            var crypt = new SHA256Managed();
+            var hash = new StringBuilder();
+            var crypto = crypt.ComputeHash(Encoding.UTF8.GetBytes(data), 0, Encoding.UTF8.GetByteCount(data));
+            foreach (var theByte in crypto)
+            {
+                hash.Append(theByte.ToString("x2"));
+            }
+            return hash.ToString();
         }
 
         /// <summary>

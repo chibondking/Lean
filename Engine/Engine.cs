@@ -17,15 +17,18 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.IO;
 using System.Linq;
 using System.Threading;
 using QuantConnect.Brokerages;
+using QuantConnect.Configuration;
 using QuantConnect.Interfaces;
-using QuantConnect.Lean.Engine.DataFeeds;
 using QuantConnect.Logging;
 using QuantConnect.Orders;
 using QuantConnect.Packets;
+using QuantConnect.Securities;
 using QuantConnect.Statistics;
+using QuantConnect.Util;
 
 namespace QuantConnect.Lean.Engine 
 {
@@ -110,16 +113,18 @@ namespace QuantConnect.Lean.Engine
                     algorithm = _algorithmHandlers.Setup.CreateAlgorithmInstance(assemblyPath, job.Language);
 
                     // Initialize the brokerage
-                    brokerage = _algorithmHandlers.Setup.CreateBrokerage(job, algorithm);
+                    IBrokerageFactory factory;
+                    brokerage = _algorithmHandlers.Setup.CreateBrokerage(job, algorithm, out factory);
 
                     // Initialize the data feed before we initialize so he can intercept added securities/universes via events
-                    _algorithmHandlers.DataFeed.Initialize(algorithm, job, _algorithmHandlers.Results, _algorithmHandlers.MapFileProvider, _algorithmHandlers.FactorFileProvider);
+                    _algorithmHandlers.DataFeed.Initialize(algorithm, job, _algorithmHandlers.Results, _algorithmHandlers.MapFileProvider, _algorithmHandlers.FactorFileProvider, _algorithmHandlers.DataFileProvider);
 
                     // initialize command queue system
                     _algorithmHandlers.CommandQueue.Initialize(job, algorithm);
 
                     // set the history provider before setting up the algorithm
-                    _algorithmHandlers.HistoryProvider.Initialize(job, _algorithmHandlers.MapFileProvider, _algorithmHandlers.FactorFileProvider, progress =>
+                    var historyProvider = GetHistoryProvider(job.HistoryProvider);
+                    historyProvider.Initialize(job, _algorithmHandlers.MapFileProvider, _algorithmHandlers.FactorFileProvider, _algorithmHandlers.DataFileProvider, progress =>
                     {
                         // send progress updates to the result handler only during initialization
                         if (!algorithm.GetLocked() || algorithm.IsWarmingUp)
@@ -128,11 +133,11 @@ namespace QuantConnect.Lean.Engine
                                 string.Format("Processing history {0}%...", progress));
                         }
                     });
-                    algorithm.HistoryProvider = _algorithmHandlers.HistoryProvider;
+                    algorithm.HistoryProvider = historyProvider;
 
                     // initialize the default brokerage message handler
-                    algorithm.BrokerageMessageHandler = new DefaultBrokerageMessageHandler(algorithm, job, _algorithmHandlers.Results, _systemHandlers.Api);
-
+                    algorithm.BrokerageMessageHandler = factory.CreateBrokerageMessageHandler(algorithm, job, _systemHandlers.Api);
+                    
                     //Initialize the internal state of algorithm and job: executes the algorithm.Initialize() method.
                     initializeComplete = _algorithmHandlers.Setup.Setup(algorithm, brokerage, job, _algorithmHandlers.Results, _algorithmHandlers.Transactions, _algorithmHandlers.RealTime);
 
@@ -233,7 +238,7 @@ namespace QuantConnect.Lean.Engine
                             }
 
                             Log.Trace("Engine.Run(): Exiting Algorithm Manager");
-                        }, job.RamAllocation);
+                        }, job.Controls.RamAllocation);
 
                         if (!complete)
                         {
@@ -255,11 +260,11 @@ namespace QuantConnect.Lean.Engine
                         if (_algorithmHandlers.DataFeed != null) _algorithmHandlers.DataFeed.Exit();
                         if (_algorithmHandlers.Results != null)
                         {
-                            var message = "Runtime Error: " + err.Message;
+                            var message = "Runtime Error: " + err;
                             Log.Trace("Engine.Run(): Sending runtime error to user...");
                             _algorithmHandlers.Results.LogMessage(message);
                             _algorithmHandlers.Results.RuntimeError(message, err.StackTrace);
-                            _systemHandlers.Api.SetAlgorithmStatus(job.AlgorithmId, AlgorithmStatus.RuntimeError, message + " Stack Trace: " + err.StackTrace);
+                            _systemHandlers.Api.SetAlgorithmStatus(job.AlgorithmId, AlgorithmStatus.RuntimeError, message + " Stack Trace: " + err);
                         }
                     }
 
@@ -271,6 +276,12 @@ namespace QuantConnect.Lean.Engine
                         var holdings = new Dictionary<string, Holding>();
                         var banner = new Dictionary<string, string>();
                         var statisticsResults = new StatisticsResults();
+
+                        var csvTransactionsFileName = Config.Get("transaction-log");
+                        if (!string.IsNullOrEmpty(csvTransactionsFileName))
+                        {
+                            SaveListOfTrades(_algorithmHandlers.Transactions, csvTransactionsFileName);
+                        }
 
                         try
                         {
@@ -293,6 +304,18 @@ namespace QuantConnect.Lean.Engine
 
                                 statisticsResults = StatisticsBuilder.Generate(trades, profitLoss, equity, performance, benchmark,
                                     _algorithmHandlers.Setup.StartingPortfolioValue, algorithm.Portfolio.TotalFees, totalTransactions);
+
+                                //Some users have $0 in their brokerage account / starting cash of $0. Prevent divide by zero errors
+                                var netReturn = _algorithmHandlers.Setup.StartingPortfolioValue > 0 ?
+                                                (algorithm.Portfolio.TotalPortfolioValue - _algorithmHandlers.Setup.StartingPortfolioValue) / _algorithmHandlers.Setup.StartingPortfolioValue
+                                                : 0;
+
+                                //Add other fixed parameters.
+                                banner.Add("Unrealized", "$" + algorithm.Portfolio.TotalUnrealizedProfit.ToString("N2"));
+                                banner.Add("Fees", "-$" + algorithm.Portfolio.TotalFees.ToString("N2"));
+                                banner.Add("Net Profit", "$" + algorithm.Portfolio.TotalProfit.ToString("N2"));
+                                banner.Add("Return", netReturn.ToString("P"));
+                                banner.Add("Equity", "$" + algorithm.Portfolio.TotalPortfolioValue.ToString("N2"));
                             }
                         }
                         catch (Exception err)
@@ -302,7 +325,7 @@ namespace QuantConnect.Lean.Engine
 
                         //Diagnostics Completed, Send Result Packet:
                         var totalSeconds = (DateTime.Now - startTime).TotalSeconds;
-                        var dataPoints = algorithmManager.DataPoints + _algorithmHandlers.HistoryProvider.DataPointCount;
+                        var dataPoints = algorithmManager.DataPoints + algorithm.HistoryProvider.DataPointCount;
                         _algorithmHandlers.Results.DebugMessage(
                             string.Format("Algorithm Id:({0}) completed in {1} seconds at {2}k data points per second. Processing total of {3} data points.",
                                 job.AlgorithmId, totalSeconds.ToString("F2"), ((dataPoints/(double) 1000)/totalSeconds).ToString("F0"),
@@ -371,5 +394,38 @@ namespace QuantConnect.Lean.Engine
                 _algorithmHandlers.RealTime.Exit();
             }
         }
+        
+        private IHistoryProvider GetHistoryProvider(string historyProvider)
+        {
+            if (historyProvider.IsNullOrEmpty())
+            {
+                historyProvider = Config.Get("history-provider", "SubscriptionDataReaderHistoryProvider");
+            }
+            return Composer.Instance.GetExportedValueByTypeName<IHistoryProvider>(historyProvider);
+        }
+        private static void SaveListOfTrades(IOrderProvider transactions, string csvFileName)
+        {
+            var orders = transactions.GetOrders(x => x.Status.IsFill());
+
+            var path = Path.GetDirectoryName(csvFileName);
+            if (path != null && !Directory.Exists(path))
+                Directory.CreateDirectory(path);
+
+            using (var writer = new StreamWriter(csvFileName))
+            {
+                foreach (var order in orders)
+                {
+                    var line = string.Format("{0},{1},{2},{3},{4}",
+                        order.Time.ToString("yyyy-MM-dd HH:mm:ss"),
+                        order.Symbol.Value,
+                        order.Direction,
+                        order.Quantity,
+                        order.Price);
+                    writer.WriteLine(line);
+                }
+            }
+        }
+
+
     } // End Algorithm Node Core Thread
 } // End Namespace
